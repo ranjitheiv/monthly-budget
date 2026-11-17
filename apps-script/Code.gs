@@ -32,8 +32,11 @@ function setup() {
   }
   const data = getData_();
   Logger.log('Setup finished.');
-  Logger.log('Expense rows: ' + data.ex.length + ', income rows: ' + data.inc.length +
+  Logger.log('Expense rows: ' + data.ex.length + ' (from ' + (data.ex[0] || [''])[0] + ' to ' +
+    (data.ex[data.ex.length - 1] || [''])[0] + '), income rows: ' + data.inc.length +
     ', budget rows: ' + data.bud.length + ', merchants mapped: ' + Object.keys(data.mer).length);
+  if (data.archive.error) Logger.log('ARCHIVE NOT READ: ' + data.archive.error);
+  else Logger.log('Archive read: ' + data.archive.expenses + ' expense rows found, older ones added.');
   Logger.log('YOUR SECRET KEY (copy it, keep it private): ' + props.getProperty('KEY'));
 }
 
@@ -90,15 +93,12 @@ function getData_() {
   const ss = SpreadsheetApp.getActive();
   const tz = ss.getSpreadsheetTimeZone();
   const cur = readTransactions_(ss, tz);
-  let arc = { ex: [], inc: [], sav: [] };
-  try {
-    arc = readTransactions_(SpreadsheetApp.openById(ARCHIVE_ID), tz);
-  } catch (err) {
-    // Archive not reachable: carry on with the current sheet only.
-  }
-  const ex = mergeMax_(arc.ex, cur.ex);
-  const inc = mergeMax_(arc.inc, cur.inc);
-  const sav = mergeMax_(arc.sav, cur.sav);
+  const arc = readArchive_(tz);
+  // The archive only fills in history from before the current sheet starts, so
+  // the overlap (2024) is never counted twice, even if a row was edited later.
+  const ex = before_(arc.ex, cur.ex).concat(cur.ex);
+  const inc = before_(arc.inc, cur.inc).concat(cur.inc);
+  const sav = before_(arc.sav, cur.sav).concat(cur.sav);
   const bud = readBudgets_(ss, tz);
 
   const people = [];
@@ -110,6 +110,7 @@ function getData_() {
 
   return {
     generated: new Date().toISOString(),
+    archive: { expenses: arc.ex.length, error: arc.error || '' },
     people: people.slice(0, 2),
     cats: categoryOrder_(ss, bud),
     ex: ex, inc: inc, sav: sav, bud: bud,
@@ -157,32 +158,22 @@ function readBudgets_(ss, tz) {
   return out;
 }
 
-/**
- * The archive and the current sheet overlap. A row that appears in both is one
- * transaction, but two identical rows inside one sheet are two real purchases.
- * So for each identical row we keep whichever sheet has more copies.
- */
-function mergeMax_(a, b) {
-  const count = function (rows) {
-    const m = {};
-    rows.forEach(function (r) {
-      const k = JSON.stringify(r);
-      if (!m[k]) m[k] = { row: r, n: 0 };
-      m[k].n++;
-    });
-    return m;
-  };
-  const ma = count(a), mb = count(b), out = [];
-  Object.keys(ma).forEach(function (k) {
-    const n = Math.max(ma[k].n, mb[k] ? mb[k].n : 0);
-    for (let i = 0; i < n; i++) out.push(ma[k].row);
-  });
-  Object.keys(mb).forEach(function (k) {
-    if (ma[k]) return;
-    for (let i = 0; i < mb[k].n; i++) out.push(mb[k].row);
-  });
-  out.sort(function (x, y) { return x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0; });
-  return out;
+function readArchive_(tz) {
+  try {
+    const out = readTransactions_(SpreadsheetApp.openById(ARCHIVE_ID), tz);
+    out.error = '';
+    return out;
+  } catch (err) {
+    return { ex: [], inc: [], sav: [], error: String(err) };
+  }
+}
+
+/** Archive rows dated before the first row of the current sheet. Rows are sorted by date. */
+function before_(archive, current) {
+  if (!current.length) return archive.slice();
+  let first = current[0][0];
+  current.forEach(function (r) { if (r[0] < first) first = r[0]; });
+  return archive.filter(function (r) { return r[0] < first; });
 }
 
 /** Category order as shown on the Yearly Tracker, then anything else that has a budget. */

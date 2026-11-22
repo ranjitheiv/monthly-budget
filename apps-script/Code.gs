@@ -402,6 +402,7 @@ function reallocate_(req) {
       const om = Number(cm.getValue()) || 0, od = Number(cd.getValue()) || 0;
       // Keep the running-sum style used in the sheet: "=-6000+1810+..." gets "+amount" (December)
       // or "-amount" (the month) added on the end, so the starting figure stays visible.
+      p.om = om; p.od = od;
       addTo_(cm, -p.amt);
       addTo_(cd, p.amt);
       changes.push(p.per + ': ' + y + '-' + m + ' ' + om + ' -> ' + (om - p.amt) + ', Dec ' + od + ' -> ' + (od + p.amt));
@@ -411,6 +412,18 @@ function reallocate_(req) {
       }
     });
     if (!changes.length) throw new Error('Nothing to move.');
+    // Read every changed cell back, so "done" is only reported when the sheet really changed.
+    SpreadsheetApp.flush();
+    const bad = [];
+    plan.forEach(function (p) {
+      const vm = Number(sh.getRange(p.rm, 4).getValue()) || 0, vd = Number(sh.getRange(p.rd, 4).getValue()) || 0;
+      if (Math.abs(vm - (p.om - p.amt)) > 0.005) bad.push('row ' + p.rm);
+      if (Math.abs(vd - (p.od + p.amt)) > 0.005) bad.push('row ' + p.rd);
+    });
+    if (bad.length) {
+      log_(ss, 'Reallocate ' + line + ' NOT CONFIRMED', 'Expected changes missing in ' + bad.join(', ') + '. ' + changes.join(' | '));
+      throw new Error('The sheet did not keep the change in ' + bad.join(' and ') + '. Is that cell open for editing in the sheet? Check the Change Log tab.');
+    }
     log_(ss, 'Reallocate ' + line, changes.join(' | ') + (req.note ? ' | note: ' + req.note : ''));
     return changes;
   } finally {

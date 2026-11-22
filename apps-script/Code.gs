@@ -13,6 +13,9 @@ const ARCHIVE_ID = '16XuIX4RY4pScWKaxFFYqtNf3lP9yCLLqyPuNlcXiGfA';
 const TAB_MERCHANT = 'Merchant';
 const TAB_FLAGS = 'Flags';
 const TAB_MARKERS = 'Markers';
+const TAB_DRAFT = 'Plan Draft';
+const TAB_LOG = 'Change Log';
+const BACKUPS_KEPT = 5;
 
 // Used only if the category order cannot be read from the Yearly Tracker tab.
 const DEFAULT_ORDER = ['Food', 'Dining/Drinks', 'Entertainment', 'Shopping', 'Groceries',
@@ -76,6 +79,9 @@ function doPost(e) {
   try {
     if (req.action === 'data') return out_({ ok: true, data: getData_() });
     if (req.action === 'saveFlags') return out_({ ok: true, flags: saveFlags_(req) });
+    if (req.action === 'reallocate') return out_({ ok: true, result: reallocate_(req) });
+    if (req.action === 'saveDraft') return out_({ ok: true, drafts: saveDraft_(req) });
+    if (req.action === 'publish') return out_({ ok: true, result: publish_(req) });
     return out_({ ok: false, error: 'unknown action' });
   } catch (err) {
     return out_({ ok: false, error: String(err) });
@@ -116,7 +122,8 @@ function getData_() {
     ex: ex, inc: inc, sav: sav, bud: bud,
     mer: syncMerchants_(ss, ex),
     flags: readFlags_(ss),
-    markers: readMarkers_(ss, tz)
+    markers: readMarkers_(ss, tz),
+    drafts: readDrafts_(ss)
   };
 }
 
@@ -321,4 +328,171 @@ function num_(v) {
   if (v === '' || v === null || v === undefined) return null;
   const n = parseFloat(String(v).replace(/[^0-9.\-]/g, ''));
   return isNaN(n) ? null : n;
+}
+
+/* ---------- Writing budgets: reallocate, drafts, publish ---------- */
+
+/**
+ * Budgets layout: B Date, C Planned (line), D Amount, E Section, F Persona, G blank, H Notes.
+ * Rows are matched exactly on month + line + section + persona.
+ */
+function budgetIndex_(sh) {
+  const tz = sh.getParent().getSpreadsheetTimeZone();
+  const last = sh.getLastRow();
+  const idx = {};
+  if (last < 5) return { idx: idx, last: last };
+  const v = sh.getRange(5, 2, last - 4, 5).getValues();
+  v.forEach(function (r, i) {
+    if (!(r[0] instanceof Date) || !r[1]) return;
+    // Read the month in the sheet's own time zone; the script's zone can differ.
+    const k = Utilities.formatDate(r[0], tz, 'yyyy-M') + '|' + String(r[1]).trim() + '|' +
+      String(r[3]).trim() + '|' + String(r[4]).trim();
+    if (!idx[k]) idx[k] = i + 5;
+  });
+  return { idx: idx, last: last };
+}
+
+function log_(ss, action, detail) {
+  const sh = ensureTab_(ss, TAB_LOG, ['When', 'Action', 'Detail']);
+  sh.appendRow([new Date(), action, detail]);
+}
+
+/** Moves money from the December pot of a drawdown line into another month, per person. */
+function reallocate_(req) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const sh = ss.getSheetByName('Budgets');
+    const y = Number(req.y), m = Number(req.m), line = String(req.line), sec = String(req.section);
+    if (m === 12) throw new Error('December is the pot itself; pick another month.');
+    const bi = budgetIndex_(sh);
+    const changes = [];
+    (req.items || []).forEach(function (it) {
+      const amt = Math.round(Number(it.amount) * 100) / 100;
+      if (!amt) return;
+      const per = String(it.person);
+      const rm = bi.idx[y + '-' + m + '|' + line + '|' + sec + '|' + per];
+      const rd = bi.idx[y + '-12|' + line + '|' + sec + '|' + per];
+      if (!rm || !rd) throw new Error('No budget row found for ' + line + ' (' + per + ') in ' + (rm ? 'December' : 'that month') + ' ' + y + '.');
+      [rm, rd].forEach(function (r) {
+        if (sh.getRange(r, 4).getFormula()) throw new Error('Row ' + r + ' holds a formula, so it was left alone.');
+      });
+      const cm = sh.getRange(rm, 4), cd = sh.getRange(rd, 4);
+      const om = Number(cm.getValue()) || 0, od = Number(cd.getValue()) || 0;
+      cm.setValue(om - amt);
+      cd.setValue(od + amt);
+      changes.push(per + ': ' + y + '-' + m + ' ' + om + ' -> ' + (om - amt) + ', Dec ' + od + ' -> ' + (od + amt));
+      if (req.note) {
+        const ch = sh.getRange(rm, 8), old = String(ch.getValue() || '').trim();
+        if (old.indexOf(req.note) < 0) ch.setValue(old ? old + ', ' + req.note : req.note);
+      }
+    });
+    if (!changes.length) throw new Error('Nothing to move.');
+    log_(ss, 'Reallocate ' + line, changes.join(' | ') + (req.note ? ' | note: ' + req.note : ''));
+    return changes;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function readDrafts_(ss) {
+  const sh = ss.getSheetByName(TAB_DRAFT);
+  if (!sh || sh.getLastRow() < 2) return [];
+  return sh.getRange(2, 1, sh.getLastRow() - 1, 8).getValues()
+    .filter(function (r) { return r[0] !== '' && r[3] !== ''; })
+    .map(function (r) {
+      return [Number(r[0]), String(r[1]), Number(r[2]), String(r[3]), String(r[4]), Number(r[5]) || 0, String(r[6] || ''),
+        r[7] instanceof Date ? r[7].toISOString() : String(r[7] || '')];
+    });
+}
+
+/** Replaces one person's draft for one year. Rows: [month, line, section, amount, note]. */
+function saveDraft_(req) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const sh = ensureTab_(ss, TAB_DRAFT, ['Year', 'Persona', 'Month', 'Line', 'Section', 'Amount', 'Note', 'Saved']);
+    const y = Number(req.y), per = String(req.person);
+    const last = sh.getLastRow();
+    if (last > 1) {
+      const keep = sh.getRange(2, 1, last - 1, 8).getValues()
+        .filter(function (r) { return !(Number(r[0]) === y && String(r[1]) === per); });
+      sh.getRange(2, 1, last - 1, 8).clearContent();
+      if (keep.length) sh.getRange(2, 1, keep.length, 8).setValues(keep);
+    }
+    const now = new Date();
+    const rows = (req.rows || []).map(function (r) {
+      return [y, per, Number(r[0]), String(r[1]), String(r[2]), Number(r[3]) || 0, String(r[4] || ''), now];
+    });
+    if (rows.length) sh.getRange(sh.getLastRow() + 1, 1, rows.length, 8).setValues(rows);
+    return readDrafts_(ss);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Writes saved drafts into Budgets: updates matching rows, appends missing ones. Backs up first. */
+function publish_(req) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const sh = ss.getSheetByName('Budgets');
+    const y = Number(req.y), people = (req.persons || []).map(String);
+    const drafts = readDrafts_(ss).filter(function (r) { return r[0] === y && people.indexOf(r[1]) >= 0; });
+    if (!drafts.length) throw new Error('No saved draft for ' + y + '.');
+
+    // Backup, keeping only the most recent few.
+    const stamp = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), 'yyyy-MM-dd HHmm');
+    const bak = sh.copyTo(ss).setName('Budgets backup ' + stamp);
+    ss.setActiveSheet(bak); ss.moveActiveSheet(ss.getNumSheets());
+    const olds = ss.getSheets().filter(function (x) { return x.getName().indexOf('Budgets backup ') === 0; })
+      .sort(function (a, b) { return a.getName() < b.getName() ? 1 : -1; });
+    olds.slice(BACKUPS_KEPT).forEach(function (x) { ss.deleteSheet(x); });
+
+    const bi = budgetIndex_(sh);
+    const n = Math.max(bi.last - 4, 0);
+    const dCol = n ? sh.getRange(5, 4, n, 1) : null, hCol = n ? sh.getRange(5, 8, n, 1) : null;
+    const dv = n ? dCol.getValues() : [], df = n ? dCol.getFormulas() : [], hv = n ? hCol.getValues() : [];
+    let updated = 0, skipped = 0;
+    const add = [];
+    drafts.forEach(function (r) {
+      const k = y + '-' + r[2] + '|' + r[3] + '|' + r[4] + '|' + r[1];
+      const row = bi.idx[k];
+      if (row) {
+        const i = row - 5;
+        if (df[i][0]) { skipped++; return; }
+        dv[i][0] = r[5];
+        if (r[6] && !String(hv[i][0] || '').trim()) hv[i][0] = r[6];
+        updated++;
+      } else {
+        add.push(r);
+      }
+    });
+    if (n) {
+      dCol.setValues(dv.map(function (x, i) { return [df[i][0] || x[0]]; }));
+      hCol.setValues(hv);
+    }
+    if (add.length) {
+      // Same layout as existing years: one block per person, month by month.
+      add.sort(function (a, b) {
+        return people.indexOf(a[1]) - people.indexOf(b[1]) || a[2] - b[2];
+      });
+      const start = sh.getLastRow() + 1;
+      const tz = ss.getSpreadsheetTimeZone();
+      // Midnight on the 1st in the sheet's time zone, so the trackers' date ranges pick the rows up.
+      const rows = add.map(function (r) {
+        return [Utilities.parseDate(y + '-' + ('0' + r[2]).slice(-2) + '-01', tz, 'yyyy-MM-dd'), r[3], r[5], r[4], r[1], '', r[6]];
+      });
+      sh.getRange(start, 2, rows.length, 7).setValues(rows);
+      if (start > 5) sh.getRange(start - 1, 2, 1, 7).copyTo(sh.getRange(start, 2, rows.length, 7), { formatOnly: true });
+    }
+    log_(ss, 'Publish ' + y, people.join(' + ') + ': ' + updated + ' updated, ' + add.length + ' added' +
+      (skipped ? ', ' + skipped + ' formula cells left alone' : '') + '. Backup: ' + bak.getName());
+    return { updated: updated, added: add.length, skipped: skipped, backup: bak.getName() };
+  } finally {
+    lock.releaseLock();
+  }
 }

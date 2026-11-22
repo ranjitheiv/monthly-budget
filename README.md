@@ -8,13 +8,16 @@ A dashboard for the Monthly Budget Google Sheet. It shows each month and year ag
 - **The API** (`apps-script/Code.gs`) lives inside the Google Sheet. The page asks it for the data and sends it any flags you save.
 - **The secret key** is what stops anyone else reading the data. It is stored once on each device. Treat it like a password.
 
-The script never edits Transactions, Budgets or Map. It only writes to three tabs it creates:
+The script never edits Transactions or Map. It changes Budgets only when you press Reallocate or Publish in the Plan tab, matching rows exactly on month, line, section and person, and it leaves formula cells alone. Everything else it writes goes to tabs it creates:
 
 | Tab | What it holds |
 |---|---|
 | Merchant | Every bank description and the merchant name it rolls up to. Fix a wrong name in column B and set column C to `manual`. |
 | Flags | Every merchant you flag in investigate mode, with the reason and note. |
 | Markers | Optional timeline labels: a date in column A, a short label in column B. |
+| Plan Draft | Saved drafts of next year's budget, one row per person, month and line. |
+| Change Log | Every reallocation and publish the app makes, with before and after values. |
+| Budgets backup … | A copy of Budgets taken before each publish. The last five are kept. |
 
 ## Setting up the Apps Script
 

@@ -357,6 +357,20 @@ function log_(ss, action, detail) {
   sh.appendRow([new Date(), action, detail]);
 }
 
+// A formula made only of numbers, + - ( ) and spaces, like "=-6000+1810+873".
+const SIMPLE_SUM = /^=[\s()0-9.+\-]+$/;
+
+function fmtAmt_(n) {
+  return String(Math.round(Math.abs(n) * 100) / 100);
+}
+
+/** Adds n to a cell: appends to a simple-sum formula, otherwise writes the new value. */
+function addTo_(cell, n) {
+  const f = cell.getFormula();
+  if (f) cell.setFormula(f + (n < 0 ? '-' : '+') + fmtAmt_(n));
+  else cell.setValue((Number(cell.getValue()) || 0) + n);
+}
+
 /** Moves money from the December pot of a drawdown line into another month, per person. */
 function reallocate_(req) {
   const lock = LockService.getScriptLock();
@@ -367,7 +381,8 @@ function reallocate_(req) {
     const y = Number(req.y), m = Number(req.m), line = String(req.line), sec = String(req.section);
     if (m === 12) throw new Error('December is the pot itself; pick another month.');
     const bi = budgetIndex_(sh);
-    const changes = [];
+    // Check every row first, so a problem with one person changes nothing for either.
+    const plan = [];
     (req.items || []).forEach(function (it) {
       const amt = Math.round(Number(it.amount) * 100) / 100;
       if (!amt) return;
@@ -376,15 +391,22 @@ function reallocate_(req) {
       const rd = bi.idx[y + '-12|' + line + '|' + sec + '|' + per];
       if (!rm || !rd) throw new Error('No budget row found for ' + line + ' (' + per + ') in ' + (rm ? 'December' : 'that month') + ' ' + y + '.');
       [rm, rd].forEach(function (r) {
-        if (sh.getRange(r, 4).getFormula()) throw new Error('Row ' + r + ' holds a formula, so it was left alone.');
+        const f = sh.getRange(r, 4).getFormula();
+        if (f && !SIMPLE_SUM.test(f)) throw new Error('Row ' + r + ' holds a formula that is more than simple sums, so nothing was changed.');
       });
-      const cm = sh.getRange(rm, 4), cd = sh.getRange(rd, 4);
+      plan.push({ per: per, amt: amt, rm: rm, rd: rd });
+    });
+    const changes = [];
+    plan.forEach(function (p) {
+      const cm = sh.getRange(p.rm, 4), cd = sh.getRange(p.rd, 4);
       const om = Number(cm.getValue()) || 0, od = Number(cd.getValue()) || 0;
-      cm.setValue(om - amt);
-      cd.setValue(od + amt);
-      changes.push(per + ': ' + y + '-' + m + ' ' + om + ' -> ' + (om - amt) + ', Dec ' + od + ' -> ' + (od + amt));
+      // Keep the running-sum style used in the sheet: "=-6000+1810+..." gets "+amount" (December)
+      // or "-amount" (the month) added on the end, so the starting figure stays visible.
+      addTo_(cm, -p.amt);
+      addTo_(cd, p.amt);
+      changes.push(p.per + ': ' + y + '-' + m + ' ' + om + ' -> ' + (om - p.amt) + ', Dec ' + od + ' -> ' + (od + p.amt));
       if (req.note) {
-        const ch = sh.getRange(rm, 8), old = String(ch.getValue() || '').trim();
+        const ch = sh.getRange(p.rm, 8), old = String(ch.getValue() || '').trim();
         if (old.indexOf(req.note) < 0) ch.setValue(old ? old + ', ' + req.note : req.note);
       }
     });
